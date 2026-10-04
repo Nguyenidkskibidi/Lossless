@@ -34,6 +34,8 @@ enum ChunkMethod : uint8_t {
     METHOD_ULTRA_MIXER     = 2, // Context Modeling (Order 1..32, Sparse) + Fixed-Point Logistic Mixer + SSE
     METHOD_TOKEN_BWT_RANS  = 3, // Transform: Tokenizer + BWT + MTF/RLE + Interleaved rANS
     METHOD_TOKEN_ULTRA     = 4, // Transform: Tokenizer + Ultra Context Mixer
+    METHOD_TOKEN_BWT_CABAC = 5, // Transform: Tokenizer + BWT + MTF + CABAC
+    METHOD_BWT_CABAC       = 6, // Transform: BWT + MTF + CABAC
 };
 
 // Architecture detection

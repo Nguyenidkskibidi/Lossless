@@ -19,6 +19,7 @@ restored_*
 /test_*
 !tests/
 slice_*
+scratch/
 
 # OS & Editor files
 .DS_Store

@@ -3,6 +3,7 @@
 #include "pax/bwt.hpp"
 #include "pax/mtf.hpp"
 #include "pax/rans.hpp"
+#include "pax/cabac.hpp"
 #include "pax/neural_mixer.hpp"
 #include "pax/thread_pool.hpp"
 #include "pax/io.hpp"
@@ -97,19 +98,34 @@ std::vector<uint8_t> PaxEngine::compress_memory(const uint8_t* in,
                 auto [bwt_data, primary] = BWT::encode(tokenized.data(), tokenized.size(), num_threads);
                 // Stage 2: MTF
                 auto mtf_data = MTF::encode(bwt_data.data(), bwt_data.size());
-                // Stage 3: Zero-RLE
+                // Stage 3: Test CABAC MTF vs Zero-RLE + rANS, pick strictly smaller
+                auto cabac_payload = CabacMtf::compress(mtf_data.data(), mtf_data.size());
                 auto rle_data = MTF::zero_rle_encode(mtf_data.data(), mtf_data.size());
-                // Stage 4: 4-way Interleaved rANS
-                comp_payload = RANS4::compress(rle_data.data(), rle_data.size());
-                method = METHOD_TOKEN_BWT_RANS;
+                auto rans_payload = RANS4::compress(rle_data.data(), rle_data.size());
+
+                if (cabac_payload.size() < rans_payload.size()) {
+                    comp_payload = std::move(cabac_payload);
+                    method = METHOD_TOKEN_BWT_CABAC;
+                } else {
+                    comp_payload = std::move(rans_payload);
+                    method = METHOD_TOKEN_BWT_RANS;
+                }
                 extra = primary;
             } else {
                 // Fallback: Standard BWT on raw stream
                 auto [bwt_data, primary] = BWT::encode(c_data, c_len, num_threads);
                 auto mtf_data = MTF::encode(bwt_data.data(), bwt_data.size());
+                auto cabac_payload = CabacMtf::compress(mtf_data.data(), mtf_data.size());
                 auto rle_data = MTF::zero_rle_encode(mtf_data.data(), mtf_data.size());
-                comp_payload = RANS4::compress(rle_data.data(), rle_data.size());
-                method = METHOD_BWT_RANS;
+                auto rans_payload = RANS4::compress(rle_data.data(), rle_data.size());
+
+                if (cabac_payload.size() < rans_payload.size()) {
+                    comp_payload = std::move(cabac_payload);
+                    method = METHOD_BWT_CABAC;
+                } else {
+                    comp_payload = std::move(rans_payload);
+                    method = METHOD_BWT_RANS;
+                }
                 extra = primary;
             }
         }
@@ -267,6 +283,22 @@ std::vector<uint8_t> PaxEngine::decompress_memory(const uint8_t* in, size_t comp
             auto bwt_data = MTF::decode(mtf_data.data(), mtf_data.size());
             // Stage 4: Inverse BWT
             chunk_out = BWT::decode(bwt_data.data(), bwt_data.size(), desc.extra);
+        } else if (desc.method == METHOD_TOKEN_BWT_CABAC) {
+            // Stage 1: CABAC MTF decode
+            auto mtf_data = CabacMtf::decompress(payload_ptr, desc.compressed_size);
+            // Stage 2: MTF decode
+            auto bwt_data = MTF::decode(mtf_data.data(), mtf_data.size());
+            // Stage 3: Inverse BWT
+            auto tokenized = BWT::decode(bwt_data.data(), bwt_data.size(), desc.extra);
+            // Stage 4: Inverse Tokenizer transform
+            chunk_out = Tokenizer::inverse_transform(tokenized.data(), tokenized.size());
+        } else if (desc.method == METHOD_BWT_CABAC) {
+            // Stage 1: CABAC MTF decode
+            auto mtf_data = CabacMtf::decompress(payload_ptr, desc.compressed_size);
+            // Stage 2: MTF decode
+            auto bwt_data = MTF::decode(mtf_data.data(), mtf_data.size());
+            // Stage 3: Inverse BWT
+            chunk_out = BWT::decode(bwt_data.data(), bwt_data.size(), desc.extra);
         } else if (desc.method == METHOD_TOKEN_BWT_RANS) {
             // Stage 1: Interleaved rANS decode
             auto rle_data = RANS4::decompress(payload_ptr, desc.compressed_size);
@@ -336,7 +368,7 @@ bool PaxEngine::compress_file(const std::string& input_path,
 
     std::cout << "[PAX] Compressing: " << input_path << " (" << in_size << " bytes = "
               << std::fixed << std::setprecision(2) << (in_size / (1024.0 * 1024.0)) << " MB)\n";
-    std::cout << "[PAX] Profile: " << (options.ultra ? "ULTRA v3.0 (Tokenizer + 64MB Long Match + Mahoney StateTable 14-Model Mixer + Range Coder)" : "STANDARD (Tokenizer + pBWT + MTF + Interleaved rANS)") << "\n";
+    std::cout << "[PAX] Profile: " << (options.ultra ? "ULTRA v3.0 (Tokenizer + 64MB Long Match + Mahoney StateTable 14-Model Mixer + Range Coder)" : "STANDARD (Tokenizer + pBWT + MTF + Context-Adaptive CABAC)") << "\n";
     if (options.ultra && !options.chunk_size_explicit) {
         std::cout << "[PAX] Mode: Continuous Streaming (Global Adaptive Model)\n";
     } else {
@@ -422,6 +454,15 @@ bool PaxEngine::decompress_file(const std::string& input_path,
 
         if (desc.method == METHOD_STORED) {
             chunk_out.assign(payload_ptr, payload_ptr + desc.compressed_size);
+        } else if (desc.method == METHOD_TOKEN_BWT_CABAC) {
+            auto mtf_data = CabacMtf::decompress(payload_ptr, desc.compressed_size);
+            auto bwt_data = MTF::decode(mtf_data.data(), mtf_data.size());
+            auto tokenized = BWT::decode(bwt_data.data(), bwt_data.size(), desc.extra);
+            chunk_out = Tokenizer::inverse_transform(tokenized.data(), tokenized.size());
+        } else if (desc.method == METHOD_BWT_CABAC) {
+            auto mtf_data = CabacMtf::decompress(payload_ptr, desc.compressed_size);
+            auto bwt_data = MTF::decode(mtf_data.data(), mtf_data.size());
+            chunk_out = BWT::decode(bwt_data.data(), bwt_data.size(), desc.extra);
         } else if (desc.method == METHOD_BWT_RANS) {
             auto rle_data = RANS4::decompress(payload_ptr, desc.compressed_size);
             auto mtf_data = MTF::zero_rle_decode(rle_data.data(), rle_data.size());
@@ -557,6 +598,15 @@ VerificationResult PaxEngine::verify_file(const std::string& pax_path, bool verb
 
             if (desc.method == METHOD_STORED) {
                 chunk_out.assign(payload_ptr, payload_ptr + desc.compressed_size);
+            } else if (desc.method == METHOD_TOKEN_BWT_CABAC) {
+                auto mtf_data = CabacMtf::decompress(payload_ptr, desc.compressed_size);
+                auto bwt_data = MTF::decode(mtf_data.data(), mtf_data.size());
+                auto tokenized = BWT::decode(bwt_data.data(), bwt_data.size(), desc.extra);
+                chunk_out = Tokenizer::inverse_transform(tokenized.data(), tokenized.size());
+            } else if (desc.method == METHOD_BWT_CABAC) {
+                auto mtf_data = CabacMtf::decompress(payload_ptr, desc.compressed_size);
+                auto bwt_data = MTF::decode(mtf_data.data(), mtf_data.size());
+                chunk_out = BWT::decode(bwt_data.data(), bwt_data.size(), desc.extra);
             } else if (desc.method == METHOD_BWT_RANS) {
                 auto rle_data = RANS4::decompress(payload_ptr, desc.compressed_size);
                 auto mtf_data = MTF::zero_rle_decode(rle_data.data(), rle_data.size());

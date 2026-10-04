@@ -6,6 +6,7 @@
 #include "pax/rans.hpp"
 #include "pax/neural_mixer.hpp"
 #include "pax/bit_arithmetic.hpp"
+#include "pax/cabac.hpp"
 #include "pax/tokenizer.hpp"
 #include "pax/engine.hpp"
 #include <iostream>
@@ -76,6 +77,25 @@ void test_rans_roundtrip() {
     assert(dec.size() == text.size());
     assert(std::memcmp(dec.data(), text.data(), text.size()) == 0);
     std::cout << "OK\n";
+}
+
+void test_cabac_roundtrip() {
+    std::cout << "[TEST] CABAC MTF Coder... " << std::flush;
+    std::vector<uint8_t> mtf_sample;
+    // Generate realistic MTF sequence: runs of zeros, small ranks, occasional larger ranks
+    for (int i = 0; i < 1000; ++i) {
+        mtf_sample.push_back(0);
+        mtf_sample.push_back(0);
+        mtf_sample.push_back(0);
+        mtf_sample.push_back(1);
+        mtf_sample.push_back(0);
+        mtf_sample.push_back(2);
+        mtf_sample.push_back(i % 10 == 0 ? static_cast<uint8_t>(i % 256) : 0);
+    }
+    auto comp = pax::CabacMtf::compress(mtf_sample.data(), mtf_sample.size());
+    auto dec = pax::CabacMtf::decompress(comp.data(), comp.size());
+    PAX_ASSERT(dec == mtf_sample);
+    std::cout << "OK (Shrank " << mtf_sample.size() << " -> " << comp.size() << " bytes)\n";
 }
 
 void test_context_mixer_roundtrip() {
@@ -170,6 +190,7 @@ int main() {
     test_bwt_roundtrip();
     test_mtf_roundtrip();
     test_rans_roundtrip();
+    test_cabac_roundtrip();
     test_context_mixer_roundtrip();
     test_end_to_end_engine();
 

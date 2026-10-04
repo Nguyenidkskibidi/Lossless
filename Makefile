@@ -37,6 +37,7 @@ SRC = src/sha256.cpp \
       src/state_table.cpp \
       src/neural_mixer.cpp \
       src/bit_arithmetic.cpp \
+      src/cabac.cpp \
       src/engine.cpp
 
 MAIN     = src/main.cpp
