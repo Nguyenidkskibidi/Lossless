@@ -13,6 +13,7 @@ struct CompressionOptions {
     bool ultra = false;
     int threads = 0; // 0 = hardware concurrency
     size_t chunk_size = 16 * 1024 * 1024; // 16 MB default for PAX v2.0
+    bool chunk_size_explicit = false;
     bool verbose = false;
 };
 

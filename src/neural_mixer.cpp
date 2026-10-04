@@ -22,37 +22,33 @@ FixedLookupTables::FixedLookupTables() {
 
 const FixedLookupTables g_fixed_tables;
 
-SSETable::SSETable() {
+SSETable1B::SSETable1B() {
     reset();
 }
 
-void SSETable::reset() {
-    for (size_t b = 0; b < BUCKETS; ++b) {
-        for (size_t c = 0; c < 256; ++c) {
-            table_[b][c] = StateCounter{};
-        }
-    }
+void SSETable1B::reset() {
+    std::memset(table_, 0, sizeof(table_));
 }
 
-uint16_t SSETable::estimate(uint16_t p_mix, uint8_t c0, size_t& out_bucket) {
+uint16_t SSETable1B::estimate(uint16_t p_mix, uint8_t c0, size_t& out_bucket) {
     size_t b = (static_cast<size_t>(p_mix) * BUCKETS) >> 12;
     if (b >= BUCKETS) b = BUCKETS - 1;
     out_bucket = b;
 
-    const auto& sc = table_[b][c0];
-    uint32_t total = sc.n0 + sc.n1;
-    if (total < 4) {
-        return p_mix; // Not enough samples, preserve sharp mixer probability!
-    }
+    uint8_t state = table_[b][c0];
+    if (state == 0) return p_mix;
 
-    uint16_t p_sse = sc.predict();
-    uint32_t w = std::min<uint32_t>(16, total);
+    uint16_t p_sse = g_mahoney.state_prob[state];
+    int n0 = MAHONEY_STATE_TABLE[state][2];
+    int n1 = MAHONEY_STATE_TABLE[state][3];
+    uint32_t total = n0 + n1;
+    uint32_t w = std::min<uint32_t>(16, total * 2);
     uint32_t blended = (static_cast<uint32_t>(p_mix) * (32 - w) + static_cast<uint32_t>(p_sse) * w) >> 5;
     return static_cast<uint16_t>(std::clamp(blended, 1U, static_cast<uint32_t>(PROB_SCALE - 1)));
 }
 
-void SSETable::update(size_t bucket, uint8_t c0, int bit) {
-    table_[bucket][c0].update(bit);
+void SSETable1B::update(size_t bucket, uint8_t c0, int bit) {
+    table_[bucket][c0] = g_mahoney.next_state[table_[bucket][c0]][bit];
 }
 
 MatchModel::MatchModel() : hash_table_(HASH_SIZE, 0), history_(MAX_HISTORY, 0) {
@@ -94,13 +90,13 @@ void MatchModel::add_byte(uint8_t byte) {
 uint16_t MatchModel::predict_bit(uint8_t c0) const {
     (void)c0;
     if (match_len_ < 4) {
-        return 2048; // Neutral probability 0.5 (logit 0)
+        return 2048;
     }
 
     uint8_t expected_byte = history_[match_pos_ % MAX_HISTORY];
     int expected_bit = (expected_byte >> bit_index_) & 1;
 
-    int conf = std::min(1950, static_cast<int>(match_len_ * 120));
+    int conf = std::min(2040, static_cast<int>(match_len_ * 180));
     return expected_bit ? static_cast<uint16_t>(2048 + conf) : static_cast<uint16_t>(2048 - conf);
 }
 
@@ -125,30 +121,37 @@ ContextMixer::ContextMixer() {
 }
 
 void ContextMixer::reset() {
-    for (int i = 0; i < 256; ++i) order0_[i] = StateCounter{};
-    for (int i = 0; i < 256; ++i) {
-        for (int j = 0; j < 256; ++j) order1_[i][j] = StateCounter{};
-    }
+    std::memset(order0_, 0, sizeof(order0_));
+    std::memset(order1_, 0, sizeof(order1_));
     model_order2_.reset();
     model_order3_.reset();
     model_order4_.reset();
+    model_order5_.reset();
     model_order6_.reset();
     model_order8_.reset();
-    model_order16_.reset();
-    model_order32_.reset();
     model_sparse1_.reset();
     model_sparse2_.reset();
     model_sparse3_.reset();
     model_word_.reset();
+    model_xml_.reset();
     match_model_.reset();
 
-    for (int i = 0; i < NUM_MODELS; ++i) weights_[i] = 1024;
-    weights_[13] = 2048; // High weight for Long Match Model
+    for (int c = 0; c < 256; ++c) {
+        for (int i = 0; i < NUM_MODELS; ++i) weights_[c][i] = 1024;
+        weights_[c][13] = 4096;
+    }
+
     sse_.reset();
     std::memset(history_, 0, sizeof(history_));
     hist_pos_ = 0;
-    hash_history_ = 0;
-    word_hash_ = 0;
+
+    curr_word_hash_ = 0;
+    prev_word_hash_ = 0;
+
+    xml_tag_hash_ = 0;
+    inside_tag_ = false;
+    inside_quotes_ = false;
+    bracket_depth_ = 0;
 }
 
 void ContextMixer::warm_seed(const uint8_t* seed_data, size_t seed_len) {
@@ -162,15 +165,31 @@ void ContextMixer::warm_seed(const uint8_t* seed_data, size_t seed_len) {
 void ContextMixer::add_byte_history(uint8_t byte) {
     history_[hist_pos_ & 63] = byte;
     hist_pos_++;
-    hash_history_ = (hash_history_ * 31337ULL) ^ (static_cast<uint64_t>(byte) + 1);
-
-    if (byte == ' ' || byte == '\n' || byte == '<' || byte == '>') {
-        word_hash_ = (word_hash_ * 1000003ULL) ^ static_cast<uint64_t>(byte);
-    } else {
-        word_hash_ = (word_hash_ * 33ULL) ^ static_cast<uint64_t>(byte);
-    }
 
     match_model_.add_byte(byte);
+
+    if (byte <= 32 || byte == '"' || byte == '<' || byte == '>' || byte == '[' || byte == ']' || byte == '{' || byte == '}') {
+        if (curr_word_hash_ != 0) {
+            prev_word_hash_ = curr_word_hash_;
+            curr_word_hash_ = 0;
+        }
+    } else {
+        curr_word_hash_ = (curr_word_hash_ * 33ULL) ^ byte;
+    }
+
+    if (byte == '<') {
+        inside_tag_ = true;
+        xml_tag_hash_ = 0;
+    } else if (byte == '>') {
+        inside_tag_ = false;
+        inside_quotes_ = false;
+    } else if (inside_tag_) {
+        if (byte == '"') inside_quotes_ = !inside_quotes_;
+        else if (!inside_quotes_ && byte > 32) xml_tag_hash_ = (xml_tag_hash_ * 33) ^ byte;
+    } else {
+        if (byte == '[') bracket_depth_++;
+        else if (byte == ']' && bracket_depth_ > 0) bracket_depth_--;
+    }
 }
 
 uint8_t ContextMixer::get_prev(size_t offset) const {
@@ -182,34 +201,53 @@ uint16_t ContextMixer::predict_bit(uint8_t c0, uint16_t preds[NUM_MODELS], size_
     uint8_t b2 = get_prev(2);
     uint8_t b3 = get_prev(3);
     uint8_t b4 = get_prev(4);
+    uint8_t b5 = get_prev(5);
+    uint8_t b6 = get_prev(6);
+    uint8_t b7 = get_prev(7);
+    uint8_t b8 = get_prev(8);
 
     uint64_t h2 = (static_cast<uint64_t>(b2) << 8) | b1;
     uint64_t h3 = (h2 << 8) | b3;
     uint64_t h4 = (h3 << 8) | b4;
-    uint64_t h6 = hash_history_ ^ (static_cast<uint64_t>(b1) * 1000003ULL);
-    uint64_t h8 = hash_history_ * 33ULL;
-    uint64_t h16 = (hash_history_ >> 16) ^ (hash_history_ << 48);
-    uint64_t h32 = hash_history_ * 0x9E3779B97F4A7C15ULL;
+    uint64_t h5 = (h4 * 31337ULL) ^ b5;
+    uint64_t h6 = (h5 * 31337ULL) ^ b6;
+    uint64_t h8 = (h6 * 31337ULL) ^ (static_cast<uint64_t>(b7) << 8) ^ b8;
 
-    preds[0]  = order0_[c0].predict();
-    preds[1]  = order1_[b1][c0].predict();
-    preds[2]  = model_order2_.get(h2, c0).predict();
-    preds[3]  = model_order3_.get(h3, c0).predict();
-    preds[4]  = model_order4_.get(h4, c0).predict();
-    preds[5]  = model_order6_.get(h6, c0).predict();
-    preds[6]  = model_order8_.get(h8, c0).predict();
-    preds[7]  = model_order16_.get(h16, c0).predict();
-    preds[8]  = model_order32_.get(h32, c0).predict();
-    preds[9]  = model_sparse1_.get(b2, c0).predict();
-    preds[10] = model_sparse2_.get(b3, c0).predict();
-    preds[11] = model_sparse3_.get(b4, c0).predict();
-    preds[12] = model_word_.get(word_hash_, c0).predict();
+    uint64_t sp1 = (static_cast<uint64_t>(b3) << 8) | b1; // skip b2
+    uint64_t sp2 = (static_cast<uint64_t>(b4) << 8) | b1; // skip b2, b3
+    uint64_t sp3 = (static_cast<uint64_t>(b3) << 8) | b2; // skip b1
+
+    uint64_t word_ctx = (prev_word_hash_ * 1000003ULL) ^ curr_word_hash_;
+    uint64_t xml_ctx = (static_cast<uint64_t>(xml_tag_hash_) << 8) | 
+                       (inside_tag_ ? 1 : 0) | 
+                       (inside_quotes_ ? 2 : 0) | 
+                       ((bracket_depth_ > 0 ? 1 : 0) << 2);
+
+    preds[0]  = g_mahoney.state_prob[order0_[c0]];
+    preds[1]  = g_mahoney.state_prob[order1_[b1][c0]];
+    preds[2]  = g_mahoney.state_prob[model_order2_.get(h2, c0)];
+    preds[3]  = g_mahoney.state_prob[model_order3_.get(h3, c0)];
+    preds[4]  = g_mahoney.state_prob[model_order4_.get(h4, c0)];
+    preds[5]  = g_mahoney.state_prob[model_order5_.get(h5, c0)];
+    preds[6]  = g_mahoney.state_prob[model_order6_.get(h6, c0)];
+    preds[7]  = g_mahoney.state_prob[model_order8_.get(h8, c0)];
+    preds[8]  = g_mahoney.state_prob[model_sparse1_.get(sp1, c0)];
+    preds[9]  = g_mahoney.state_prob[model_sparse2_.get(sp2, c0)];
+    preds[10] = g_mahoney.state_prob[model_sparse3_.get(sp3, c0)];
+    preds[11] = g_mahoney.state_prob[model_word_.get(word_ctx, c0)];
+    preds[12] = g_mahoney.state_prob[model_xml_.get(xml_ctx, c0)];
     preds[13] = match_model_.predict_bit(c0);
 
     int32_t sum = 0;
-    for (int k = 0; k < NUM_MODELS; ++k) {
-        int16_t l = g_fixed_tables.logit(preds[k]);
-        sum += (weights_[k] * static_cast<int32_t>(l)) >> 10;
+    size_t mlen = match_model_.current_len();
+    if (mlen >= 6) {
+        int16_t l_match = g_fixed_tables.logit(preds[13]);
+        sum = static_cast<int32_t>(l_match) * 3;
+    } else {
+        for (int k = 0; k < NUM_MODELS; ++k) {
+            int16_t l = g_fixed_tables.logit(preds[k]);
+            sum += (weights_[c0][k] * static_cast<int32_t>(l)) >> 10;
+        }
     }
 
     uint16_t p_mix = g_fixed_tables.sigmoid(sum);
@@ -225,38 +263,58 @@ void ContextMixer::update(uint8_t c0, int bit, const uint16_t preds[NUM_MODELS],
     uint8_t b2 = get_prev(2);
     uint8_t b3 = get_prev(3);
     uint8_t b4 = get_prev(4);
+    uint8_t b5 = get_prev(5);
+    uint8_t b6 = get_prev(6);
+    uint8_t b7 = get_prev(7);
+    uint8_t b8 = get_prev(8);
 
     uint64_t h2 = (static_cast<uint64_t>(b2) << 8) | b1;
     uint64_t h3 = (h2 << 8) | b3;
     uint64_t h4 = (h3 << 8) | b4;
-    uint64_t h6 = hash_history_ ^ (static_cast<uint64_t>(b1) * 1000003ULL);
-    uint64_t h8 = hash_history_ * 33ULL;
-    uint64_t h16 = (hash_history_ >> 16) ^ (hash_history_ << 48);
-    uint64_t h32 = hash_history_ * 0x9E3779B97F4A7C15ULL;
+    uint64_t h5 = (h4 * 31337ULL) ^ b5;
+    uint64_t h6 = (h5 * 31337ULL) ^ b6;
+    uint64_t h8 = (h6 * 31337ULL) ^ (static_cast<uint64_t>(b7) << 8) ^ b8;
 
-    order0_[c0].update(bit);
-    order1_[b1][c0].update(bit);
-    model_order2_.get(h2, c0).update(bit);
-    model_order3_.get(h3, c0).update(bit);
-    model_order4_.get(h4, c0).update(bit);
-    model_order6_.get(h6, c0).update(bit);
-    model_order8_.get(h8, c0).update(bit);
-    model_order16_.get(h16, c0).update(bit);
-    model_order32_.get(h32, c0).update(bit);
-    model_sparse1_.get(b2, c0).update(bit);
-    model_sparse2_.get(b3, c0).update(bit);
-    model_sparse3_.get(b4, c0).update(bit);
-    model_word_.get(word_hash_, c0).update(bit);
+    uint64_t sp1 = (static_cast<uint64_t>(b3) << 8) | b1;
+    uint64_t sp2 = (static_cast<uint64_t>(b4) << 8) | b1;
+    uint64_t sp3 = (static_cast<uint64_t>(b3) << 8) | b2;
 
-    int32_t error = (bit ? PROB_SCALE : 0) - static_cast<int32_t>(p_final);
-    for (int k = 0; k < NUM_MODELS; ++k) {
-        int16_t l = g_fixed_tables.logit(preds[k]);
-        int32_t dw = (error * static_cast<int32_t>(l)) >> 14;
-        weights_[k] = std::clamp(weights_[k] + dw, -32768, 32767);
+    uint64_t word_ctx = (prev_word_hash_ * 1000003ULL) ^ curr_word_hash_;
+    uint64_t xml_ctx = (static_cast<uint64_t>(xml_tag_hash_) << 8) | 
+                       (inside_tag_ ? 1 : 0) | 
+                       (inside_quotes_ ? 2 : 0) | 
+                       ((bracket_depth_ > 0 ? 1 : 0) << 2);
+
+    order0_[c0] = g_mahoney.next_state[order0_[c0]][bit];
+    order1_[b1][c0] = g_mahoney.next_state[order1_[b1][c0]][bit];
+    model_order2_.update(h2, c0, bit);
+    model_order3_.update(h3, c0, bit);
+    model_order4_.update(h4, c0, bit);
+    model_order5_.update(h5, c0, bit);
+    model_order6_.update(h6, c0, bit);
+    model_order8_.update(h8, c0, bit);
+    model_sparse1_.update(sp1, c0, bit);
+    model_sparse2_.update(sp2, c0, bit);
+    model_sparse3_.update(sp3, c0, bit);
+    model_word_.update(word_ctx, c0, bit);
+    model_xml_.update(xml_ctx, c0, bit);
+
+    size_t mlen = match_model_.current_len();
+    if (mlen < 6) {
+        int32_t error = (bit ? PROB_SCALE : 0) - static_cast<int32_t>(p_final);
+        for (int k = 0; k < NUM_MODELS; ++k) {
+            int16_t l = g_fixed_tables.logit(preds[k]);
+            int32_t dw = (error * static_cast<int32_t>(l)) >> 13;
+            weights_[c0][k] = std::clamp(weights_[c0][k] + dw, -32768, 32767);
+        }
     }
 }
 
-std::vector<uint8_t> ContextMixer::compress(const uint8_t* in, size_t n, const uint8_t* seed, size_t seed_len) {
+std::vector<uint8_t> ContextMixer::compress(const uint8_t* in,
+                                            size_t n,
+                                            const uint8_t* seed,
+                                            size_t seed_len,
+                                            ProgressCallback progress) {
     if (n == 0) return {};
 
     RangeBitEncoder enc;
@@ -267,6 +325,8 @@ std::vector<uint8_t> ContextMixer::compress(const uint8_t* in, size_t n, const u
 
     uint16_t preds[NUM_MODELS];
     size_t sse_bucket = 0;
+
+    size_t report_interval = std::max<size_t>(1000000, n / 100);
 
     for (size_t i = 0; i < n; ++i) {
         uint8_t byte = in[i];
@@ -279,12 +339,21 @@ std::vector<uint8_t> ContextMixer::compress(const uint8_t* in, size_t n, const u
             c0 = (c0 << 1) | bit;
         }
         mixer.add_byte_history(byte);
+
+        if (progress && (i % report_interval == 0 || i == n - 1)) {
+            progress(i + 1, n);
+        }
     }
     enc.finish();
     return enc.release_buffer();
 }
 
-std::vector<uint8_t> ContextMixer::decompress(const uint8_t* in, size_t comp_len, size_t orig_len, const uint8_t* seed, size_t seed_len) {
+std::vector<uint8_t> ContextMixer::decompress(const uint8_t* in,
+                                              size_t comp_len,
+                                              size_t orig_len,
+                                              const uint8_t* seed,
+                                              size_t seed_len,
+                                              ProgressCallback progress) {
     if (orig_len == 0) return {};
 
     RangeBitDecoder dec(in, comp_len);
@@ -299,6 +368,8 @@ std::vector<uint8_t> ContextMixer::decompress(const uint8_t* in, size_t comp_len
     std::vector<uint8_t> out;
     out.reserve(orig_len);
 
+    size_t report_interval = std::max<size_t>(1000000, orig_len / 100);
+
     for (size_t i = 0; i < orig_len; ++i) {
         uint8_t byte = 0;
         uint8_t c0 = 1;
@@ -311,6 +382,10 @@ std::vector<uint8_t> ContextMixer::decompress(const uint8_t* in, size_t comp_len
         }
         mixer.add_byte_history(byte);
         out.push_back(byte);
+
+        if (progress && (i % report_interval == 0 || i == orig_len - 1)) {
+            progress(i + 1, orig_len);
+        }
     }
     return out;
 }

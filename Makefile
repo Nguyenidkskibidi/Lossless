@@ -34,6 +34,7 @@ SRC = src/sha256.cpp \
       src/bwt.cpp \
       src/mtf.cpp \
       src/rans.cpp \
+      src/state_table.cpp \
       src/neural_mixer.cpp \
       src/bit_arithmetic.cpp \
       src/engine.cpp

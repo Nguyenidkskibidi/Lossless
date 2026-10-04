@@ -92,6 +92,7 @@ int main(int argc, char* argv[]) {
             size_t mb = static_cast<size_t>(std::strtoul(argv[++i], nullptr, 10));
             if (mb > 0) {
                 options.chunk_size = mb * 1024 * 1024;
+                options.chunk_size_explicit = true;
             }
         } else if (arg == "-ultra" || arg == "--ultra") {
             options.ultra = true;

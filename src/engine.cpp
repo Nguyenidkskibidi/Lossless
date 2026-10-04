@@ -18,7 +18,12 @@ std::vector<uint8_t> PaxEngine::compress_memory(const uint8_t* in,
     // 1. Calculate overall SHA-256 of original raw input
     auto original_sha = SHA256::hash(in, n);
 
-    size_t chunk_size = std::max<size_t>(65536, options.chunk_size);
+    size_t chunk_size = options.chunk_size;
+    if (options.ultra && !options.chunk_size_explicit) {
+        chunk_size = std::max<size_t>(65536, n);
+    } else {
+        chunk_size = std::max<size_t>(65536, options.chunk_size);
+    }
     uint32_t num_chunks = static_cast<uint32_t>((n + chunk_size - 1) / chunk_size);
     if (n == 0) num_chunks = 0;
 
@@ -55,15 +60,34 @@ std::vector<uint8_t> PaxEngine::compress_memory(const uint8_t* in,
         uint32_t extra = 0;
 
         if (options.ultra) {
+            auto progress_cb = [&](size_t done, size_t total) {
+                if (num_chunks == 1) {
+                    auto now = std::chrono::high_resolution_clock::now();
+                    double el = std::chrono::duration<double>(now - t0).count();
+                    double mb_s = el > 0 ? (done / (1024.0 * 1024.0)) / el : 0.0;
+                    double pct = (100.0 * done) / total;
+                    double eta = (mb_s > 0) ? (static_cast<double>(total - done) / (1024.0 * 1024.0)) / mb_s : 0.0;
+                    int eta_m = static_cast<int>(eta) / 60;
+                    int eta_s = static_cast<int>(eta) % 60;
+                    std::cout << "\r[PAX Ultra Progress] " << (done / (1024 * 1024)) << " MB / "
+                              << (total / (1024 * 1024)) << " MB (" << std::fixed << std::setprecision(1) << pct
+                              << "%) - " << std::setprecision(2) << mb_s << " MB/s - ETA: "
+                              << eta_m << "m " << (eta_s < 10 ? "0" : "") << eta_s << "s" << std::flush;
+                }
+            };
+
             auto tokenized = Tokenizer::transform(c_data, c_len);
             if (!tokenized.empty()) {
-                comp_payload = ContextMixer::compress(tokenized.data(), tokenized.size(), seed_ptr, seed_len);
+                comp_payload = ContextMixer::compress(tokenized.data(), tokenized.size(), seed_ptr, seed_len, progress_cb);
                 method = METHOD_TOKEN_ULTRA;
                 extra = static_cast<uint32_t>(tokenized.size());
             } else {
-                comp_payload = ContextMixer::compress(c_data, c_len, seed_ptr, seed_len);
+                comp_payload = ContextMixer::compress(c_data, c_len, seed_ptr, seed_len, progress_cb);
                 method = METHOD_ULTRA_MIXER;
                 extra = 0;
+            }
+            if (num_chunks == 1) {
+                std::cout << "\n";
             }
         } else {
             // Stage 0: Dynamic Tokenizer Pre-transform for natural text / XML
@@ -312,8 +336,12 @@ bool PaxEngine::compress_file(const std::string& input_path,
 
     std::cout << "[PAX] Compressing: " << input_path << " (" << in_size << " bytes = "
               << std::fixed << std::setprecision(2) << (in_size / (1024.0 * 1024.0)) << " MB)\n";
-    std::cout << "[PAX] Profile: " << (options.ultra ? "ULTRA v3.0 (Tokenizer + 64MB Long Match + Markov 2^24 + Range Coder)" : "STANDARD (Tokenizer + pBWT + MTF + Interleaved rANS)") << "\n";
-    std::cout << "[PAX] Chunk size: " << (options.chunk_size / (1024 * 1024)) << " MB\n";
+    std::cout << "[PAX] Profile: " << (options.ultra ? "ULTRA v3.0 (Tokenizer + 64MB Long Match + Mahoney StateTable 14-Model Mixer + Range Coder)" : "STANDARD (Tokenizer + pBWT + MTF + Interleaved rANS)") << "\n";
+    if (options.ultra && !options.chunk_size_explicit) {
+        std::cout << "[PAX] Mode: Continuous Streaming (Global Adaptive Model)\n";
+    } else {
+        std::cout << "[PAX] Chunk size: " << (options.chunk_size / (1024 * 1024)) << " MB\n";
+    }
 
     auto comp_data = compress_memory(view.data(), in_size, options);
 

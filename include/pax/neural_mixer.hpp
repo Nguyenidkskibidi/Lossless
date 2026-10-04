@@ -1,10 +1,13 @@
 #pragma once
 
 #include "pax/common.hpp"
+#include "pax/state_table.hpp"
 #include <vector>
 #include <array>
 #include <cmath>
 #include <algorithm>
+#include <functional>
+#include <cstring>
 
 namespace pax {
 
@@ -31,54 +34,40 @@ struct FixedLookupTables {
 
 extern const FixedLookupTables g_fixed_tables;
 
-struct StateCounter {
-    uint8_t n0 = 0;
-    uint8_t n1 = 0;
-
-    inline uint16_t predict() const {
-        return static_cast<uint16_t>((static_cast<uint32_t>(n1 + 1) * PROB_SCALE) / (n0 + n1 + 2));
-    }
-
-    inline void update(int bit) {
-        if (bit == 0) {
-            if (n0 < 250) n0++;
-            else { n0 = (n0 + 1) >> 1; n1 = (n1 + 1) >> 1; }
-        } else {
-            if (n1 < 250) n1++;
-            else { n0 = (n0 + 1) >> 1; n1 = (n1 + 1) >> 1; }
-        }
-    }
-};
-
 template <size_t SIZE_BITS>
-struct HashContextModel {
+struct HashContextModel1B {
     static constexpr size_t TABLE_SIZE = 1ULL << SIZE_BITS;
     static constexpr size_t MASK = TABLE_SIZE - 1;
-    std::vector<StateCounter> table;
+    std::vector<uint8_t> table;
 
-    HashContextModel() : table(TABLE_SIZE) {}
+    HashContextModel1B() : table(TABLE_SIZE, 0) {}
 
     void reset() {
-        std::fill(table.begin(), table.end(), StateCounter{});
+        std::fill(table.begin(), table.end(), 0);
     }
 
-    inline StateCounter& get(uint64_t hash, uint8_t c0) {
+    inline uint8_t get(uint64_t hash, uint8_t c0) const {
         size_t idx = (hash ^ (static_cast<uint64_t>(c0) * 2654435761ULL)) & MASK;
         return table[idx];
     }
+
+    inline void update(uint64_t hash, uint8_t c0, int bit) {
+        size_t idx = (hash ^ (static_cast<uint64_t>(c0) * 2654435761ULL)) & MASK;
+        table[idx] = g_mahoney.next_state[table[idx]][bit];
+    }
 };
 
-class SSETable {
+class SSETable1B {
 public:
     static constexpr size_t BUCKETS = 32;
 
-    SSETable();
+    SSETable1B();
     void reset();
     uint16_t estimate(uint16_t p_mix, uint8_t c0, size_t& out_bucket);
     void update(size_t bucket, uint8_t c0, int bit);
 
 private:
-    StateCounter table_[BUCKETS][256];
+    uint8_t table_[BUCKETS][256];
 };
 
 // Long Match Model with 64 MB history sliding window
@@ -93,6 +82,7 @@ public:
     void reset();
 
     void add_byte(uint8_t byte);
+    inline size_t current_len() const { return match_len_; }
     uint16_t predict_bit(uint8_t c0) const;
     void update_bit(int bit);
 
@@ -108,43 +98,60 @@ private:
 
 class ContextMixer {
 public:
+    using ProgressCallback = std::function<void(size_t done, size_t total)>;
+
     ContextMixer();
     void reset();
 
     void warm_seed(const uint8_t* seed_data, size_t seed_len);
-
     void add_byte_history(uint8_t byte);
     uint8_t get_prev(size_t offset) const;
 
     uint16_t predict_bit(uint8_t c0, uint16_t preds[NUM_MODELS], size_t& sse_bucket);
     void update(uint8_t c0, int bit, const uint16_t preds[NUM_MODELS], size_t sse_bucket, uint16_t p_final);
 
-    static std::vector<uint8_t> compress(const uint8_t* in, size_t n, const uint8_t* seed = nullptr, size_t seed_len = 0);
-    static std::vector<uint8_t> decompress(const uint8_t* in, size_t comp_len, size_t orig_len, const uint8_t* seed = nullptr, size_t seed_len = 0);
+    static std::vector<uint8_t> compress(const uint8_t* in,
+                                         size_t n,
+                                         const uint8_t* seed = nullptr,
+                                         size_t seed_len = 0,
+                                         ProgressCallback progress = nullptr);
+
+    static std::vector<uint8_t> decompress(const uint8_t* in,
+                                           size_t comp_len,
+                                           size_t orig_len,
+                                           const uint8_t* seed = nullptr,
+                                           size_t seed_len = 0,
+                                           ProgressCallback progress = nullptr);
 
 private:
-    StateCounter order0_[256];
-    StateCounter order1_[256][256];
-    HashContextModel<24> model_order2_;  // 16M entries (32 MB)
-    HashContextModel<24> model_order3_;  // 16M entries (32 MB)
-    HashContextModel<24> model_order4_;  // 16M entries (32 MB)
-    HashContextModel<24> model_order6_;  // 16M entries (32 MB)
-    HashContextModel<24> model_order8_;  // 16M entries (32 MB)
-    HashContextModel<24> model_order16_; // 16M entries (32 MB)
-    HashContextModel<24> model_order32_; // 16M entries (32 MB)
-    HashContextModel<22> model_sparse1_; // 4M entries (8 MB)
-    HashContextModel<22> model_sparse2_; // 4M entries (8 MB)
-    HashContextModel<22> model_sparse3_; // 4M entries (8 MB)
-    HashContextModel<22> model_word_;    // 4M entries (8 MB)
-    MatchModel match_model_;             // 64 MB history sliding window
+    uint8_t order0_[256];
+    uint8_t order1_[256][256];
+    HashContextModel1B<24> model_order2_;  // 16M entries (16 MB)
+    HashContextModel1B<24> model_order3_;  // 16M entries (16 MB)
+    HashContextModel1B<24> model_order4_;  // 16M entries (16 MB)
+    HashContextModel1B<24> model_order5_;  // 16M entries (16 MB)
+    HashContextModel1B<24> model_order6_;  // 16M entries (16 MB)
+    HashContextModel1B<24> model_order8_;  // 16M entries (16 MB)
+    HashContextModel1B<22> model_sparse1_; // 4M entries (4 MB)
+    HashContextModel1B<22> model_sparse2_; // 4M entries (4 MB)
+    HashContextModel1B<22> model_sparse3_; // 4M entries (4 MB)
+    HashContextModel1B<24> model_word_;    // 16M entries (16 MB)
+    HashContextModel1B<24> model_xml_;     // 16M entries (16 MB)
+    MatchModel match_model_;               // 64 MB history sliding window
 
-    int32_t weights_[NUM_MODELS];
-    SSETable sse_;
+    int32_t weights_[256][NUM_MODELS];
+    SSETable1B sse_;
 
     uint8_t history_[64];
     size_t hist_pos_;
-    uint64_t hash_history_;
-    uint64_t word_hash_;
+
+    uint64_t curr_word_hash_;
+    uint64_t prev_word_hash_;
+
+    uint32_t xml_tag_hash_;
+    bool inside_tag_;
+    bool inside_quotes_;
+    int bracket_depth_;
 };
 
 } // namespace pax
