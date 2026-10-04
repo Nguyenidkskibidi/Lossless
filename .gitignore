@@ -1,0 +1,28 @@
+# Build targets and binaries
+/pax
+/pax_test
+*.o
+*.a
+*.so
+*.dylib
+*.dSYM/
+build/
+bin/
+
+# Archive files & benchmark datasets
+*.pax
+enwik9
+enwik8
+*.raw
+*.bin
+restored_*
+/test_*
+!tests/
+slice_*
+
+# OS & Editor files
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
